@@ -1,0 +1,553 @@
+# Mess Management System — Full System Design
+
+**Stack:** Vue 3 (web) · Ionic Vue + Capacitor (mobile) · Node.js/Express (API) · MySQL 8 (database)
+
+---
+
+## 1. Overview & Assumptions
+
+A "mess" here means a shared living/food arrangement (hostel, bachelor's flat, office mess) where a group of members share a common kitchen budget. A **manager** buys groceries (bazar), tracks member meals, collects monthly cash deposits, and at month-end calculates who owes money and who gets a refund.
+
+The system is **multi-tenant**: one deployment supports many independent messes. A single user account can be a manager of one mess and a member of another.
+
+Assumptions made explicit (flag if any should change):
+- Currency is configurable per mess (default BDT), not hardcoded.
+- Meals are counted in **fractional units** (0.5, 1, 1.5...) so half-meals and guest meals work naturally.
+- Non-food costs (utility, rent, house-help salary) can be split **equally** among active members or **by meal-ratio**, configurable per cost entry.
+- "Manager can change active members each month" means membership *participation* is tracked per calendar cycle, not just once — someone can be paused for a month (e.g., went home) without being removed from the mess permanently.
+
+---
+
+## 2. User Roles & Permissions
+
+| Role | Scope | Can do |
+|---|---|---|
+| **Manager** | Per mess (a mess can have 1+ managers) | Create/close monthly cycles, add/remove members, activate/deactivate members per cycle, record bazar, record deposits, add other costs, view all summaries |
+| **Member** | Per mess | View own meal history, submit meal counts (if self-entry allowed), view bazar list, view own deposit history, view own monthly statement |
+| **Super Admin** *(optional)* | Whole system | Manage all messes, support/troubleshooting, view logs — only needed if you're running this as a SaaS product for many unrelated messes |
+
+A single `users` table backs all roles; role is contextual per mess via the `mess_members` join table (someone can be a manager in Mess A and a plain member in Mess B).
+
+---
+
+## 3. System Architecture
+
+```
+┌─────────────────┐     ┌──────────────────┐
+│   Vue 3 Web App   │     │  Ionic Vue Mobile │
+│ (Manager + Member)│     │  (Capacitor iOS/  │
+│                    │     │   Android)        │
+└─────────┬──────────┘     └────────┬─────────┘
+          │        HTTPS / JWT      │
+          └───────────┬─────────────┘
+                       │
+              ┌────────▼─────────┐
+              │  Node.js/Express  │
+              │   REST API        │
+              │  (Auth, business  │
+              │   logic, calc)    │
+              └────────┬─────────┘
+                       │
+        ┌──────────────┼───────────────┐
+        │              │               │
+  ┌─────▼─────┐  ┌─────▼──────┐  ┌─────▼─────┐
+  │  MySQL 8   │  │ File store  │  │  FCM push  │
+  │ (Sequelize/│  │ (receipts,  │  │ (mobile     │
+  │  Prisma)   │  │  avatars)   │  │  reminders) │
+  └───────────┘  └────────────┘  └────────────┘
+```
+
+**Why Ionic Vue + Capacitor for mobile:** since the web app is Vue, wrapping the same components with Capacitor gets you native iOS/Android apps (camera for receipt photos, push notifications, offline storage) while reusing ~70-80% of your Vue code and a single Pinia store layer. This avoids maintaining a separate mobile codebase in a different framework.
+
+---
+
+## 4. Tech Stack
+
+| Layer | Choice | Notes |
+|---|---|---|
+| Web frontend | Vue 3 (Composition API) + Pinia + Vue Router | Tailwind CSS or Vuetify for UI |
+| Mobile | Ionic Vue + Capacitor | Shares components/store with web |
+| Backend | Node.js + Express (or Fastify) | REST API, JWT auth |
+| ORM | Sequelize or Prisma | Prisma gives better TS types; Sequelize is more mature for MySQL-specific features |
+| Database | MySQL 8 | InnoDB engine, foreign keys enforced |
+| Auth | JWT (access + refresh tokens) + bcrypt | Refresh tokens stored server-side for revocation |
+| File storage | Local disk (dev) → S3-compatible bucket (prod) | Bazar receipt photos, avatars |
+| Push notifications | Firebase Cloud Messaging | Due reminders, month-closed alerts |
+| Validation | Zod or Joi | Both request body and DB-layer validation |
+| Deployment | Docker + Nginx + PM2 | Nginx reverse proxy + SSL termination |
+| Caching (optional) | Redis | Cache computed monthly summaries, rate limiting store |
+
+---
+
+## 5. Database Design
+
+### 5.1 Entity Overview
+
+```
+users ──< mess_members >── messes
+              │
+              ├──< cycle_member_status >── mess_cycles
+              │
+              ├──< meals (per cycle, per date)
+              ├──< deposits (per cycle)
+              └──< bazar_entries ──< bazar_items
+
+mess_cycles ──< other_costs
+mess_cycles ──< member_month_summary >── mess_members
+```
+
+- `messes` — one row per mess (tenant)
+- `users` — one row per person, reusable across messes
+- `mess_members` — join table: which users belong to which mess, and their base role/status
+- `mess_cycles` — one row per mess per calendar month ("this month's ledger")
+- `cycle_member_status` — **this is the table that lets a manager toggle who is active *for a given month*** without touching the person's overall membership
+- `meals`, `bazar_entries`/`bazar_items`, `deposits`, `other_costs` — the raw transactional data for a cycle
+- `member_month_summary` — the computed, stored result once a month is closed (so historical statements never silently change if formulas evolve later)
+
+### 5.2 Full DDL
+
+```sql
+-- ============================================
+-- USERS
+-- ============================================
+CREATE TABLE users (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  email VARCHAR(150) NOT NULL UNIQUE,
+  phone VARCHAR(20) UNIQUE,
+  password_hash VARCHAR(255) NOT NULL,
+  avatar_url VARCHAR(255),
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- ============================================
+-- MESSES (tenants)
+-- ============================================
+CREATE TABLE messes (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) NOT NULL,
+  address VARCHAR(255),
+  currency VARCHAR(10) NOT NULL DEFAULT 'BDT',
+  created_by BIGINT UNSIGNED NOT NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+-- ============================================
+-- MESS MEMBERS (who belongs to which mess, base role/status)
+-- ============================================
+CREATE TABLE mess_members (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  mess_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  role ENUM('manager','member') NOT NULL DEFAULT 'member',
+  joined_at DATE NOT NULL,
+  left_at DATE NULL,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_mess_user (mess_id, user_id),
+  FOREIGN KEY (mess_id) REFERENCES messes(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- MESS CYCLES (one row = one mess's one calendar month)
+-- ============================================
+CREATE TABLE mess_cycles (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  mess_id BIGINT UNSIGNED NOT NULL,
+  cycle_year SMALLINT NOT NULL,
+  cycle_month TINYINT NOT NULL, -- 1..12
+  status ENUM('open','closed') NOT NULL DEFAULT 'open',
+  total_bazar_amount DECIMAL(12,2) DEFAULT 0,
+  total_other_cost DECIMAL(12,2) DEFAULT 0,
+  total_meals DECIMAL(10,2) DEFAULT 0,
+  meal_rate DECIMAL(10,4) DEFAULT 0,
+  closed_at DATETIME NULL,
+  closed_by BIGINT UNSIGNED NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_mess_month (mess_id, cycle_year, cycle_month),
+  FOREIGN KEY (mess_id) REFERENCES messes(id) ON DELETE CASCADE,
+  FOREIGN KEY (closed_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+-- ============================================
+-- CYCLE MEMBER STATUS — manager toggles active members PER MONTH here
+-- ============================================
+CREATE TABLE cycle_member_status (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  mess_member_id BIGINT UNSIGNED NOT NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  opening_due DECIMAL(12,2) NOT NULL DEFAULT 0, -- carried forward balance from prior month
+  note VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_cycle_member (cycle_id, mess_member_id),
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE,
+  FOREIGN KEY (mess_member_id) REFERENCES mess_members(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- MEALS (daily entries per member per cycle)
+-- ============================================
+CREATE TABLE meals (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  mess_member_id BIGINT UNSIGNED NOT NULL,
+  meal_date DATE NOT NULL,
+  breakfast DECIMAL(3,2) NOT NULL DEFAULT 0,
+  lunch DECIMAL(3,2) NOT NULL DEFAULT 0,
+  dinner DECIMAL(3,2) NOT NULL DEFAULT 0,
+  guest_meals DECIMAL(3,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_cycle_member_date (cycle_id, mess_member_id, meal_date),
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE,
+  FOREIGN KEY (mess_member_id) REFERENCES mess_members(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- BAZAR (shopping trips) + ITEMS (line-level detail)
+-- ============================================
+CREATE TABLE bazar_entries (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  mess_member_id BIGINT UNSIGNED NOT NULL, -- who did the shopping
+  bazar_date DATE NOT NULL,
+  total_amount DECIMAL(12,2) NOT NULL DEFAULT 0, -- sum of bazar_items, kept for fast reads
+  note VARCHAR(255),
+  receipt_image_url VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE,
+  FOREIGN KEY (mess_member_id) REFERENCES mess_members(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE bazar_items (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  bazar_entry_id BIGINT UNSIGNED NOT NULL,
+  product_name VARCHAR(100) NOT NULL,
+  quantity DECIMAL(10,3) NOT NULL DEFAULT 1,
+  unit VARCHAR(20) DEFAULT 'pcs', -- kg, liter, pcs, dozen...
+  unit_price DECIMAL(10,2) NOT NULL DEFAULT 0,
+  sub_total DECIMAL(12,2) NOT NULL DEFAULT 0, -- quantity * unit_price
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (bazar_entry_id) REFERENCES bazar_entries(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- DEPOSITS (member cash submitted for the month)
+-- ============================================
+CREATE TABLE deposits (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  mess_member_id BIGINT UNSIGNED NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  deposit_date DATE NOT NULL,
+  payment_method ENUM('cash','bkash','nagad','bank','other') NOT NULL DEFAULT 'cash',
+  note VARCHAR(255),
+  received_by BIGINT UNSIGNED, -- manager who recorded it
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE,
+  FOREIGN KEY (mess_member_id) REFERENCES mess_members(id),
+  FOREIGN KEY (received_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+-- ============================================
+-- OTHER COSTS (utility, rent, servant salary, etc.)
+-- ============================================
+CREATE TABLE other_costs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  category ENUM('utility','rent','servant','maintenance','other') NOT NULL DEFAULT 'other',
+  title VARCHAR(150) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL,
+  cost_date DATE NOT NULL,
+  split_type ENUM('equal','meal_based') NOT NULL DEFAULT 'equal',
+  note VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- MEMBER MONTH SUMMARY (computed & stored when a cycle closes)
+-- ============================================
+CREATE TABLE member_month_summary (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  cycle_id BIGINT UNSIGNED NOT NULL,
+  mess_member_id BIGINT UNSIGNED NOT NULL,
+  total_meals DECIMAL(10,2) NOT NULL DEFAULT 0,
+  meal_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
+  other_cost_share DECIMAL(12,2) NOT NULL DEFAULT 0,
+  total_cost DECIMAL(12,2) NOT NULL DEFAULT 0,
+  total_deposit DECIMAL(12,2) NOT NULL DEFAULT 0,
+  opening_due DECIMAL(12,2) NOT NULL DEFAULT 0,
+  balance DECIMAL(12,2) NOT NULL DEFAULT 0, -- positive = refund, negative = due
+  status ENUM('due','refund','settled') NOT NULL DEFAULT 'settled',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_cycle_member_summary (cycle_id, mess_member_id),
+  FOREIGN KEY (cycle_id) REFERENCES mess_cycles(id) ON DELETE CASCADE,
+  FOREIGN KEY (mess_member_id) REFERENCES mess_members(id)
+) ENGINE=InnoDB;
+
+-- ============================================
+-- NOTIFICATIONS (mobile push / in-app)
+-- ============================================
+CREATE TABLE notifications (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  mess_id BIGINT UNSIGNED,
+  title VARCHAR(150) NOT NULL,
+  body VARCHAR(500),
+  type VARCHAR(50), -- 'due_reminder','month_closed','new_bazar', etc.
+  is_read TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- ============================================
+-- ACTIVITY LOG (audit trail — recommended for financial data)
+-- ============================================
+CREATE TABLE activity_logs (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  mess_id BIGINT UNSIGNED,
+  user_id BIGINT UNSIGNED,
+  action VARCHAR(100) NOT NULL, -- 'bazar.create','deposit.update','cycle.close'...
+  entity_type VARCHAR(50),
+  entity_id BIGINT UNSIGNED,
+  meta JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- Recommended extra indexes for reporting queries
+CREATE INDEX idx_meals_date ON meals(meal_date);
+CREATE INDEX idx_bazar_date ON bazar_entries(bazar_date);
+CREATE INDEX idx_deposits_date ON deposits(deposit_date);
+```
+
+---
+
+## 6. Core Business Logic — Monthly Cost Calculation
+
+This is the heart of the system. Here's the formula, then the exact algorithm, then a worked example.
+
+### 6.1 Formulas
+
+```
+Meal Rate = Total Bazar Amount (cycle) / Total Meals (all active members, cycle)
+
+Per-Member Meal Cost = Meal Rate × Member's Total Meals
+
+Equal-Split Other Cost (per member) = Sum(other_costs where split_type='equal') / Active Member Count
+
+Meal-Based Other Cost (per member) = Sum(other_costs where split_type='meal_based') × (Member's Meals / Total Meals)
+
+Per-Member Total Cost = Meal Cost + Equal-Split Share + Meal-Based Share
+
+Per-Member Balance = Total Deposit + Opening Due (carry-forward) − Total Cost
+
+  Balance > 0  → REFUND owed to member
+  Balance < 0  → member owes the mess (DUE)
+  Balance = 0  → SETTLED
+```
+
+### 6.2 Closing-a-cycle algorithm (pseudocode)
+
+```
+function closeCycle(cycleId):
+  cycle = getCycle(cycleId)
+  activeMembers = getCycleMemberStatus(cycleId, is_active=true)
+
+  totalBazar = SUM(bazar_entries.total_amount WHERE cycle_id = cycleId)
+  totalMeals = SUM(meals.breakfast+lunch+dinner+guest_meals
+                    WHERE cycle_id = cycleId AND member IN activeMembers)
+  mealRate = totalBazar / totalMeals
+
+  equalOtherTotal     = SUM(other_costs.amount WHERE split_type='equal')
+  mealBasedOtherTotal = SUM(other_costs.amount WHERE split_type='meal_based')
+  equalSharePerMember = equalOtherTotal / COUNT(activeMembers)
+
+  FOR EACH member IN activeMembers:
+    memberMeals    = SUM(meals for this member)
+    mealCost       = memberMeals * mealRate
+    mealBasedShare = mealBasedOtherTotal * (memberMeals / totalMeals)
+    otherShare     = equalSharePerMember + mealBasedShare
+    totalCost      = mealCost + otherShare
+    totalDeposit   = SUM(deposits for this member, this cycle)
+    openingDue     = cycle_member_status.opening_due
+    balance        = totalDeposit + openingDue - totalCost
+    status         = balance > 0 ? 'refund' : balance < 0 ? 'due' : 'settled'
+    UPSERT member_month_summary(...)
+
+  cycle.status = 'closed'
+  cycle.closed_at = NOW()
+  cycle.meal_rate = mealRate
+  cycle.total_bazar_amount = totalBazar
+  cycle.total_meals = totalMeals
+  cycle.total_other_cost = equalOtherTotal + mealBasedOtherTotal
+  SAVE cycle
+```
+
+Run this inside a **DB transaction** — either every member's summary row and the cycle status update all commit, or none do.
+
+### 6.3 Worked Example
+
+Mess "Green Villa", August 2026, 4 active members. Total bazar = ৳24,000. Other costs (utility + servant salary) = ৳4,000, split equally.
+
+| Member | Meals | Meal Cost (rate ×120) | Other Share | Total Cost | Deposit | Balance | Result |
+|---|---|---|---|---|---|---|---|
+| Rahim | 45 | 5,400 | 1,000 | 6,400 | 6,000 | −400 | **Due 400** |
+| Karim | 60 | 7,200 | 1,000 | 8,200 | 9,000 | +800 | **Refund 800** |
+| Sumon | 50 | 6,000 | 1,000 | 7,000 | 7,000 | 0 | Settled |
+| Jamal | 45 | 5,400 | 1,000 | 6,400 | 6,000 | −400 | **Due 400** |
+| **Total** | **200** | **24,000** | **4,000** | **28,000** | 28,000 | 0 | — |
+
+Meal Rate = 24,000 ÷ 200 = **৳120/meal**. Note the totals balance to zero — deposits collected should equal total cost when everyone pays exactly on target; the due/refund numbers are just redistributing the mismatch between what each person deposited versus what they actually consumed.
+
+### 6.4 Manager changing active members mid-cycle
+
+- `mess_members.status` = whether someone is in the mess **at all** (permanent).
+- `cycle_member_status.is_active` = whether they're **counted in this month's split** (temporary/monthly).
+- A member who goes home for 10 days still gets `is_active=1` for the month (they just log fewer meals during that time — meals naturally drop to near-zero for those dates), *unless* the manager explicitly excludes them from the cost split, in which case set `is_active=0` and they're skipped entirely in `closeCycle()`.
+- A brand-new member joining mid-month: create their `mess_members` row, then a `cycle_member_status` row for the current cycle only — no need to touch past cycles.
+- When a new cycle is created (1st of each month), the API should **auto-copy** the previous cycle's `cycle_member_status.is_active` values as defaults, so the manager only needs to toggle the few members who changed, not re-enter everyone.
+
+---
+
+## 7. REST API Design
+
+| Method | Endpoint | Role | Description |
+|---|---|---|---|
+| POST | `/api/auth/register` | — | Create account |
+| POST | `/api/auth/login` | — | Returns access + refresh JWT |
+| POST | `/api/auth/refresh` | — | Rotate access token |
+| GET | `/api/auth/me` | any | Current user profile |
+| POST | `/api/messes` | any (becomes manager) | Create a new mess |
+| GET | `/api/messes` | any | List messes user belongs to |
+| GET/PUT | `/api/messes/:id` | manager | View/update mess settings |
+| POST | `/api/messes/:id/members` | manager | Add a member |
+| GET | `/api/messes/:id/members` | manager/member | List members |
+| PUT/DELETE | `/api/messes/:id/members/:memberId` | manager | Update role/status, remove |
+| POST | `/api/messes/:id/cycles` | manager | Open a new month cycle |
+| GET | `/api/messes/:id/cycles` | manager/member | List cycles (history) |
+| GET | `/api/cycles/:id` | manager/member | Cycle detail |
+| PUT | `/api/cycles/:id/close` | manager | **Runs the calculation, locks the month** |
+| GET/PUT | `/api/cycles/:id/members` | manager | View/toggle active members for this month |
+| POST | `/api/cycles/:id/meals` | manager/member | Add meal entry (bulk or single) |
+| GET | `/api/cycles/:id/meals` | manager/member | List meal entries |
+| POST | `/api/cycles/:id/bazar` | manager | Create bazar entry with item array |
+| GET | `/api/cycles/:id/bazar` | manager/member | List bazar entries |
+| POST | `/api/cycles/:id/deposits` | manager | Record a member's cash deposit |
+| GET | `/api/cycles/:id/deposits` | manager/member | List deposits |
+| POST | `/api/cycles/:id/other-costs` | manager | Add utility/rent/etc. |
+| GET | `/api/cycles/:id/summary` | manager/member | Full month summary (live or closed) |
+| GET | `/api/cycles/:id/summary/:memberId` | member | Individual statement |
+| GET | `/api/notifications` | any | List notifications |
+
+### 7.1 Sample: Create a bazar entry
+
+```json
+POST /api/cycles/42/bazar
+{
+  "mess_member_id": 3,
+  "bazar_date": "2026-08-05",
+  "note": "Weekly groceries",
+  "items": [
+    { "product_name": "Rice", "quantity": 10, "unit": "kg", "unit_price": 65 },
+    { "product_name": "Chicken", "quantity": 3, "unit": "kg", "unit_price": 220 },
+    { "product_name": "Cooking Oil", "quantity": 2, "unit": "liter", "unit_price": 180 }
+  ]
+}
+```
+Server computes `sub_total` per item and `total_amount` on the entry (650 + 660 + 360 = 1,670) — never trust a client-supplied total.
+
+### 7.2 Sample: Month summary response
+
+```json
+GET /api/cycles/42/summary
+{
+  "cycle": { "year": 2026, "month": 8, "status": "closed", "meal_rate": 120.0 },
+  "totals": { "bazar": 24000, "other_cost": 4000, "meals": 200 },
+  "members": [
+    { "name": "Rahim", "meals": 45, "meal_cost": 5400, "other_share": 1000,
+      "total_cost": 6400, "deposit": 6000, "balance": -400, "status": "due" },
+    { "name": "Karim", "meals": 60, "meal_cost": 7200, "other_share": 1000,
+      "total_cost": 8200, "deposit": 9000, "balance": 800, "status": "refund" }
+  ]
+}
+```
+
+---
+
+## 8. Mobile App Strategy
+
+- **Framework:** Ionic Vue + Capacitor, sharing the Vue components/Pinia store with the web app. Same API, same auth flow.
+- **Offline meal entry:** members often log meals without signal (at home, in a room with no wifi). Cache entries locally (e.g., `localForage`/IndexedDB via Capacitor Storage), sync to the server when connectivity returns — check for conflicts via `updated_at` timestamps.
+- **Push notifications:** Firebase Cloud Messaging for "bazar added," "month closed — you have a due of X," "deposit received" confirmations.
+- **Camera integration:** Capacitor Camera plugin to photograph bazar receipts, uploaded alongside the bazar entry.
+- **Role-aware UI:** managers get bazar/deposit/cost entry screens; members get a read-focused dashboard (their meals, their balance, mess-wide bazar feed).
+
+---
+
+## 9. Security & Non-Functional Requirements
+
+- Password hashing with **bcrypt** (cost factor ≥ 10).
+- **JWT** access tokens (short-lived, ~15 min) + refresh tokens (stored server-side, revocable on logout).
+- Role-based middleware on every route — a member must never be able to call manager-only endpoints even if they know the URL.
+- Request validation with **Zod/Joi** on every POST/PUT body.
+- Use the ORM's parameterized queries everywhere — never string-concatenate SQL.
+- **Rate limiting** (`express-rate-limit`) on auth endpoints to slow brute-force attempts.
+- **Helmet** for secure HTTP headers, CORS whitelist restricted to your web/mobile origins.
+- All financial calculations happen **server-side only** — clients display, never compute, cost splits.
+- Database backups: scheduled `mysqldump` (or managed MySQL snapshot) at least daily, given this holds financial records.
+- `activity_logs` table gives you an audit trail — important once real money is involved, so disputes ("who changed my meal count?") are answerable.
+
+---
+
+## 10. Suggested Project Structure
+
+```
+mess-management/
+├── server/                 # Node.js/Express API
+│   ├── src/
+│   │   ├── models/         # Sequelize/Prisma models
+│   │   ├── routes/
+│   │   ├── controllers/
+│   │   ├── services/       # closeCycle() and other business logic lives here
+│   │   ├── middleware/     # auth, role-check, validation
+│   │   └── utils/
+│   └── migrations/
+├── web/                    # Vue 3 web app
+│   └── src/
+│       ├── views/
+│       ├── components/
+│       ├── stores/         # Pinia
+│       └── api/            # Axios client
+├── mobile/                 # Ionic Vue + Capacitor (can share ../web/src via alias or a shared package)
+└── shared/                 # Shared TS types/constants used by both web & mobile
+```
+
+---
+
+## 11. Development Roadmap
+
+**Phase 1 — MVP**
+Auth, mess + member CRUD, monthly cycle creation, meal entry, bazar entry (with items), deposits, close-cycle calculation, basic summary view.
+
+**Phase 2**
+Push notifications, PDF/export of monthly statements, per-member historical reports, multi-mess switcher UI, mobile offline sync.
+
+**Phase 3**
+Opening-balance auto carry-forward, SMS reminders, analytics dashboard (spending trends per category), multi-language support.
+
+---
+
+*This document is meant to be a living reference — update the schema/API sections as implementation decisions evolve.*

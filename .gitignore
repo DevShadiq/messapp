@@ -1,0 +1,31 @@
+node_modules/
+web/node_modules/
+web/dist/
+server/data/store.json
+.env
+*.log
+
+# Local Codex workspace state
+.agents/
+
+# Local environment overrides and secrets
+.env.local
+.env.*.local
+server/.env
+web/.env
+web/.env.local
+
+# Test reports, tool caches, and debug output
+coverage/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
