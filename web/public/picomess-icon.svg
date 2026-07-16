@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title>PicoMess</title>
+  <rect width="512" height="512" rx="128" fill="#6958ef"/>
+  <path fill="#fff" d="M154 116h136c62 0 108 40 108 101 0 63-47 103-109 103h-48v76c0 17-14 30-31 30s-31-13-31-30V146c0-17 14-30 31-30h-56Zm87 61v82h45c31 0 50-16 50-41s-19-41-50-41h-45Z"/>
+  <path fill="#dcd8ff" d="M338 336c0-17 14-30 31-30s31 13 31 30-14 30-31 30-31-13-31-30Z"/>
+</svg>

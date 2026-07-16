@@ -25,4 +25,14 @@ if (!roleColumns.length) {
   console.log('Applied migration: users.system_role; first mess owner promoted to super admin.');
 }
 
+const [mealConfirmationColumns] = await pool.execute(`
+  SELECT COLUMN_NAME FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA=? AND TABLE_NAME='meals' AND COLUMN_NAME='is_confirmed'
+`, [process.env.DB_NAME]);
+
+if (!mealConfirmationColumns.length) {
+  await pool.execute('ALTER TABLE meals ADD COLUMN is_confirmed TINYINT(1) NOT NULL DEFAULT 0 AFTER guest_meals, ADD COLUMN confirmed_at DATETIME NULL AFTER is_confirmed, ADD COLUMN confirmed_by BIGINT UNSIGNED NULL AFTER confirmed_at, ADD CONSTRAINT fk_meals_confirmed_by FOREIGN KEY (confirmed_by) REFERENCES users(id)');
+  console.log('Applied migration: meals confirmation fields.');
+}
+
 await pool.end();

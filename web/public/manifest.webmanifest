@@ -1,0 +1,16 @@
+{
+  "name": "PicoMess",
+  "short_name": "PicoMess",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f7fb",
+  "theme_color": "#6958ef",
+  "icons": [
+    {
+      "src": "/picomess-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
