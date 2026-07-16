@@ -17,6 +17,7 @@ if (!process.env.JWT_ACCESS_SECRET || !process.env.JWT_REFRESH_SECRET) {
 const app = express();
 const port = Number(process.env.PORT || 4000);
 const origins = (process.env.WEB_ORIGIN || 'http://localhost:5173').split(',').map((x) => x.trim());
+app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin(origin, callback) { callback(null, !origin || origins.includes(origin)); }, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
