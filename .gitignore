@@ -4,6 +4,8 @@ web/dist/
 server/data/store.json
 .env
 *.log
+*.md
+*.txt
 
 # Local Codex workspace state
 .agents/

@@ -19,7 +19,8 @@ const managedMessId = ref(null), managedCycles = ref([]), managedMembers = ref([
 const editMessForm = ref({id:null,name:'',address:'',currency:'BDT'});
 const editCycleForm = ref({id:null,year:new Date().getFullYear(),month:new Date().getMonth()+1});
 const managedMemberForm = ref({name:'',email:'',role:'member'});
-const allUsers = ref([]), editingUser = ref(null);
+const allUsers = ref([]), editingUser = ref(null), assignmentTarget = ref(null);
+const assignmentForm = ref({messId:null,role:'member'});
 const adminMessId = ref(Number(localStorage.getItem('picomess_admin_mess')) || null);
 const mealMemberFilter = ref('all');
 const reportMemberId = ref('');
@@ -37,7 +38,7 @@ const memberOptions = computed(()=>visibleMembers.value.map((member)=>({value:me
 const mealFilterOptions = computed(()=>[{value:'all',label:'All users'},...memberOptions.value.map((member)=>({value:String(member.value),label:member.label}))]);
 const cycleOptions = computed(()=>cycles.value.map((cycle)=>({value:cycle.id,label:cycleOptionLabel(cycle)})));
 const managedCycleOptions = computed(()=>[{value:null,label:'Select an open cycle'},...managedCycles.value.map((cycle)=>({value:cycle.id,label:`${cycleOptionLabel(cycle)}${cycle.status==='closed'?' (locked)':''}`,disabled:cycle.status==='closed'}))]);
-const data = ref(null), loading = ref(false), error = ref(''), active = ref('Overview'), modal = ref(''), toast = ref(''), mobileNav = ref(false);
+const data = ref(null), loading = ref(false), error = ref(''), active = ref('Overview'), modal = ref(''), toast = ref(''), mobileNav = ref(false), sidebarHidden = ref(false);
 const editingId = ref(null);
 const form = ref({});
 const nav = [
@@ -75,6 +76,7 @@ async function load() { if(!token.value) return; loading.value=true; try { const
 async function switchCycle(){if(!selectedCycleId.value||selectedCycleId.value===data.value?.cycle.id)return;loading.value=true;error.value='';try{data.value=await request(isSuperAdmin.value?`/api/admin/cycles/${selectedCycleId.value}/dashboard`:`/api/cycles/${selectedCycleId.value}/dashboard`);mealMemberFilter.value='all';flash(`Showing ${cycleName.value}`)}catch(e){error.value=e.message;selectedCycleId.value=data.value?.cycle.id}finally{loading.value=false}}
 function cycleOptionLabel(cycle){const name=new Date(cycle.year,cycle.month-1).toLocaleDateString('en',{month:'long',year:'numeric'});return `${name} · ${cycle.status}`}
 function logout(){ token.value='';user.value=null;data.value=null;localStorage.removeItem('picomess_token');localStorage.removeItem('picomess_user'); }
+function toggleSidebar(){if(window.matchMedia('(max-width:780px)').matches){mobileNav.value=!mobileNav.value;return;}sidebarHidden.value=!sidebarHidden.value;}
 function open(type){ editingId.value=null; modal.value=type; error.value=''; const now=new Date().toISOString().slice(0,10), defaultMember=(type==='meal'&&!isManager.value?currentMember.value:visibleMembers.value[0]) || data.value.members[0]; form.value={ date:now, memberId:defaultMember?.id, breakfast:1,lunch:1,dinner:1,guest:0,method:'cash',category:'utility',splitType:'equal',role:'member',items:[{product:'',quantity:1,unit:'kg',unitPrice:0}] }; }
 function openNextCycle(){const date=new Date(data.value.cycle.year,data.value.cycle.month);editingId.value=null;modal.value='cycle';error.value='';form.value={year:date.getFullYear(),month:date.getMonth()+1};}
 function openEdit(type,row){editingId.value=row.id;modal.value=type;error.value='';form.value=JSON.parse(JSON.stringify(row));if(type==='bazar'&&!Array.isArray(form.value.items))form.value.items=[];}
@@ -104,6 +106,9 @@ async function changeManagedMemberRole(item,role){loading.value=true;error.value
 async function removeManagedMember(item){if(!confirm(`Remove ${item.name} from ${editMessForm.value.name}? Their other mess assignments will remain.`))return;loading.value=true;error.value='';try{await request(`/api/messes/${managedMessId.value}/members/${item.id}`,{method:'DELETE'});await loadManagedMess();flash('Member removed from this mess')}catch(e){error.value=e.message}finally{loading.value=false}}
 function openUserEditor(item){error.value='';editingUser.value={...item,phone:item.phone||''};}
 async function updateUser(){loading.value=true;error.value='';try{await request(`/api/admin/users/${editingUser.value.id}`,{method:'PUT',body:JSON.stringify({name:editingUser.value.name,email:editingUser.value.email,phone:editingUser.value.phone||null,isActive:Boolean(editingUser.value.isActive)})});editingUser.value=null;await loadSettings();flash('User updated')}catch(e){error.value=e.message}finally{loading.value=false}}
+function openUserAssignment(account){error.value='';assignmentTarget.value=account;assignmentForm.value={messId:settingsMesses.value[0]?.id||null,role:'member'};}
+async function assignUserToMess(){if(!assignmentTarget.value)return;loading.value=true;error.value='';try{await request(`/api/admin/users/${assignmentTarget.value.id}/messes`,{method:'POST',body:JSON.stringify({messId:Number(assignmentForm.value.messId),role:assignmentForm.value.role})});const name=assignmentTarget.value.name;assignmentTarget.value=null;await loadSettings();flash(`${name} assigned to the mess`)}catch(e){error.value=e.message}finally{loading.value=false}}
+async function deleteInactiveUser(account){if(!confirm(`Permanently delete ${account.name}'s inactive account? This is only possible when they are no longer assigned to any mess.`))return;loading.value=true;error.value='';try{await request(`/api/admin/users/${account.id}`,{method:'DELETE'});await loadSettings();flash('Inactive account deleted')}catch(e){error.value=e.message}finally{loading.value=false}}
 async function go(label){active.value=label;mobileNav.value=false;if(label==='Settings')await loadSettings();}
 onMounted(()=>{form.value={email:'',password:''};if(token.value&&!user.value?.mustChangePassword)load()});
 </script>
@@ -199,7 +204,7 @@ onMounted(()=>{form.value={email:'',password:''};if(token.value&&!user.value?.mu
     </div>
   </div>
 
-  <div v-else class="app-shell">
+  <div v-else :class="['app-shell',{'sidebar-hidden':sidebarHidden}]">
     <aside :class="['sidebar',{open:mobileNav}]">
       <div class="brand">
 <span class="brand-mark">
@@ -246,7 +251,7 @@ onMounted(()=>{form.value={email:'',password:''};if(token.value&&!user.value?.mu
 
     <main class="main">
       <header>
-<button class="menu-btn" @click="mobileNav=true">
+<button class="menu-btn" @click="toggleSidebar" :aria-label="sidebarHidden?'Show workspace menu':'Hide workspace menu'" :aria-expanded="!sidebarHidden">
 <Menu/>
 </button>
 <div class="search">
@@ -839,6 +844,14 @@ onMounted(()=>{form.value={email:'',password:''};if(token.value&&!user.value?.mu
 <Settings :size="15"/>
 <span>Edit</span>
 </button>
+<button v-if="account.isActive" type="button" class="member-password" @click="openUserAssignment(account)">
+<Plus :size="15"/>
+<span>Assign mess</span>
+</button>
+<button v-else type="button" class="danger-button compact" @click="deleteInactiveUser(account)">
+<Trash2 :size="15"/>
+<span>Delete</span>
+</button>
 </div>
 <p v-if="!allUsers.length" class="empty-members">No accounts found.</p>
 </div>
@@ -1034,6 +1047,27 @@ onMounted(()=>{form.value={email:'',password:''};if(token.value&&!user.value?.mu
 <LoaderCircle v-if="loading" class="spin" :size="17"/>Set temporary password</button>
 </div>
 </form>
+    </div>
+
+    <div v-if="assignmentTarget" class="overlay modal-overlay" @mousedown.self="assignmentTarget=null">
+      <form class="modal password-modal" @submit.prevent="assignUserToMess">
+<div class="modal-head">
+<div>
+<span class="eyebrow">Mess membership</span>
+<h2>Assign {{assignmentTarget.name}}</h2>
+</div>
+<button type="button" @click="assignmentTarget=null"><X/></button>
+</div>
+<p>Choose a mess and whether this account is a member or manager. Existing memberships are updated and reactivated.</p>
+<label>Mess<SearchSelect v-model="assignmentForm.messId" :options="messOptions" placeholder="Search messes" /></label>
+<label>Role<SearchSelect v-model="assignmentForm.role" :options="roleOptions" /></label>
+<p v-if="error" class="form-error">{{error}}</p>
+<div class="modal-actions">
+<button type="button" class="ghost" @click="assignmentTarget=null">Cancel</button>
+<button class="primary" :disabled="loading||!assignmentForm.messId">
+<LoaderCircle v-if="loading" class="spin" :size="17"/>Assign to mess</button>
+</div>
+      </form>
     </div>
 
     <div v-if="modal" class="overlay modal-overlay" @mousedown.self="modal=''">
